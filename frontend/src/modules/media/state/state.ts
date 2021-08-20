@@ -10,6 +10,7 @@ import create from "zustand";
 import { signalingChannel } from "../../../shared/services/theme/signalling";
 import { RoomState } from "../services/PeersManager";
 import { sig } from "./sig";
+import {logger} from '../../../logger';
 
 type ProducerStore = {
   webcam?: Producer;
@@ -27,14 +28,14 @@ export const useProducerStore = create<ProducerStore>((set) => ({
           const { transports } = useTransportStore.getState();
           if (!transports) return;
           // Create
-          console.log("Creating " + media);
+          logger.info("Creating " + media);
           this[media] = await transports.send.produce({
             track: localStreams[media].getTracks()[0],
             encodings: [],
             appData: { mediaTag: media },
           });
         } else if (mediaProducer.paused) {
-          console.log("Resuming " + media);
+          logger.info("Resuming " + media);
           await sig("resume-producer", { producerId: mediaProducer.id });
           mediaProducer.resume();
         } else {
@@ -48,11 +49,11 @@ export const useProducerStore = create<ProducerStore>((set) => ({
             // Cannot pause screen because if user uses the browser native controls to stop screen
             // the browser will stop and delete the media tracks, and therefore the producer cannot be
             // resumed
-            console.log("Closing " + media);
+            logger.info("Closing " + media);
             await sig("close-producer", { producerId: producer.id });
             producer.close();
           } else {
-            console.log("Pasuing " + media);
+            logger.info("Pasuing " + media);
             await sig("pause-producer", { producerId: producer.id });
             producer.pause();
           }
@@ -77,7 +78,7 @@ type RoomStore = {
   closeConsumer(consumerId: string): void;
   pauseConsumer(consumerId: string): void;
   resumeConsumer(consumerId: string): void;
-  addNewPeer(peerId: string): void;
+  addNewPeer(peerId: string, name: string): void;
   removePeer(peerId: string): void;
 };
 
@@ -158,7 +159,7 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
       consumers,
     });
   },
-  addNewPeer(peerId: string) {
+  addNewPeer(peerId: string, name: string) {
     const { room } = get();
     if (peerId in room.peers) {
       return;
@@ -171,6 +172,7 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
       consumerLayers: [],
       consumers: [],
       id: peerId,
+      name,
       joinTs: new Date().valueOf(),
       lastSeenTs: new Date().valueOf(),
       media: {},
@@ -199,11 +201,11 @@ export const useActivePeerConsumers = () => {
     const peerConsumers = peer.id in consumers ? consumers[peer.id] : [];
     activePeerConsumers.push({
       peerId: peer.id,
+      name: peer.name,
       consumers: peerConsumers.filter((c) => !c.closed && !c.paused),
     });
   }
-  console.log("activePeerConsumers");
-  console.log(activePeerConsumers);
+  logger.info({activePeerConsumers : activePeerConsumers}, "activePeerConsumers");
 
   return activePeerConsumers;
 };
@@ -269,12 +271,27 @@ type LocalStreamsStore = {
   webcam: MediaStream;
   screen: MediaStream;
   config: StreamConfig;
+  deviceConfig: DeviceConfig;
+  availableDevices: {
+    deviceId: string;
+    label: string;
+    kind: MediaDeviceKind;
+  }[];
   muteAudio(): void;
   unmuteAudio(): Promise<void>;
+  setAudioDevice(deviceId: string): Promise<void>;
   muteWebcam(): void;
   unmuteWebcam(): Promise<void>;
+  setWebcamDevice(deviceId: string): Promise<void>;
   muteScreen(): void;
   unmuteScreen(): Promise<void>;
+  setAvailableDevices(
+    devices: {
+      deviceId: string;
+      label: string;
+      kind: MediaDeviceKind;
+    }[]
+  ): Promise<void>;
 };
 
 export const useLocalStreams = create<LocalStreamsStore>((set, get) => ({
@@ -287,12 +304,19 @@ export const useLocalStreams = create<LocalStreamsStore>((set, get) => ({
     webcam: false,
     screen: false,
   },
+  deviceConfig: {
+    audio: undefined,
+    webcam: undefined,
+  },
+  availableDevices: [],
   muteAudio() {
     const state = get();
     if (!state.config.audio) return;
 
     // state.audio.getTracks().forEach(t => t.stop());
-    state.combinedStream.removeTrack(state.audio.getTracks()[0]);
+    const track = state.audio.getTracks()[0];
+    state.combinedStream.removeTrack(track);
+    state.audio.removeTrack(track);
 
     set({
       config: {
@@ -304,12 +328,19 @@ export const useLocalStreams = create<LocalStreamsStore>((set, get) => ({
   async unmuteAudio() {
     const state = get();
     if (state.config.audio) return;
+    if (!state.deviceConfig.audio) {
+      alert("No devices found");
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+        audio: {
+          deviceId: state.deviceConfig.audio,
+        },
       });
-      stream.getTracks().forEach((t) => state.audio.addTrack(t));
-      state.combinedStream.addTrack(state.audio.getTracks()[0]);
+      const track = stream.getTracks()[0];
+      state.audio.addTrack(track);
+      state.combinedStream.addTrack(track);
       set({
         config: {
           ...state.config,
@@ -317,8 +348,21 @@ export const useLocalStreams = create<LocalStreamsStore>((set, get) => ({
         },
       });
     } catch (error) {
-      console.log(error);
-      alert("Unable top capture audio");
+      logger.error({error:error}, "error");
+      alert("Unable to capture audio");
+    }
+  },
+  async setAudioDevice(deviceId: string) {
+    const state = get();
+    set({
+      deviceConfig: {
+        ...state.deviceConfig,
+        audio: deviceId,
+      },
+    });
+    if (state.config.audio) {
+      get().muteAudio();
+      await get().unmuteAudio();
     }
   },
   muteWebcam() {
@@ -326,7 +370,9 @@ export const useLocalStreams = create<LocalStreamsStore>((set, get) => ({
     if (!state.config.webcam) return;
 
     // state.webcam.getTracks().forEach(t => t.stop());
-    state.combinedStream.removeTrack(state.webcam.getTracks()[0]);
+    const track = state.webcam.getTracks()[0];
+    state.combinedStream.removeTrack(track);
+    state.webcam.removeTrack(track);
 
     set({
       config: {
@@ -338,16 +384,23 @@ export const useLocalStreams = create<LocalStreamsStore>((set, get) => ({
   async unmuteWebcam() {
     let state = get();
     if (state.config.webcam) return;
+    if (!state.deviceConfig.webcam) {
+      alert("No devices found");
+      return;
+    }
     if (state.config.screen) {
       state.muteScreen();
     }
     state = get();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
+        video: {
+          deviceId: state.deviceConfig.webcam,
+        },
       });
-      stream.getTracks().forEach((t) => state.webcam.addTrack(t));
-      state.combinedStream.addTrack(state.webcam.getTracks()[0]);
+      const track = stream.getTracks()[0];
+      state.webcam.addTrack(track);
+      state.combinedStream.addTrack(track);
       set({
         config: {
           ...state.config,
@@ -355,8 +408,21 @@ export const useLocalStreams = create<LocalStreamsStore>((set, get) => ({
         },
       });
     } catch (error) {
-      console.log(error);
-      alert("Unable top capture webcam");
+      logger.error({error:error}, "error");
+      alert("Unable to capture webcam");
+    }
+  },
+  async setWebcamDevice(deviceId: string) {
+    const state = get();
+    set({
+      deviceConfig: {
+        ...state.deviceConfig,
+        webcam: deviceId,
+      },
+    });
+    if (state.config.webcam) {
+      get().muteWebcam();
+      await get().unmuteWebcam();
     }
   },
   muteScreen() {
@@ -401,8 +467,108 @@ export const useLocalStreams = create<LocalStreamsStore>((set, get) => ({
         },
       });
     } catch (error) {
-      console.log(error);
+      logger.error({error:error}, "error");
       alert("Unable top capture screen");
+    }
+  },
+  async setAvailableDevices(
+    devices: { deviceId: string; label: string; kind: MediaDeviceKind }[]
+  ) {
+    // remove unidentified devices
+    devices = devices.filter((device) => device.deviceId !== "");
+
+    let state = get();
+    set({
+      availableDevices: devices,
+    });
+
+    const defaultAudioDevice = devices.find(
+      (device) => device.kind === "audioinput"
+    );
+    const defaultWebcamDevice = devices.find(
+      (device) => device.kind === "videoinput"
+    );
+
+    // audio device detected
+    if (!state.deviceConfig.audio && defaultAudioDevice) {
+      set({
+        deviceConfig: {
+          ...state.deviceConfig,
+          audio: defaultAudioDevice.deviceId,
+        },
+      });
+      state = get();
+    }
+    // device lost
+    if (
+      state.deviceConfig.audio &&
+      !devices.find(
+        (device) =>
+          device.kind === "audioinput" &&
+          device.deviceId === state.deviceConfig.audio
+      )
+    ) {
+      get().muteAudio();
+      set({
+        deviceConfig: {
+          ...get().deviceConfig,
+          audio: undefined,
+        },
+      });
+
+      logger.info({defaultAudioDevice:defaultAudioDevice},"Lost");
+
+      // fallback to default
+      if (defaultAudioDevice) {
+        set({
+          deviceConfig: {
+            ...get().deviceConfig,
+            audio: defaultAudioDevice.deviceId,
+          },
+        });
+        get().unmuteAudio();
+      }
+      state = get();
+    }
+
+    // video device detected
+    if (!state.deviceConfig.webcam && defaultWebcamDevice) {
+      set({
+        deviceConfig: {
+          ...state.deviceConfig,
+          webcam: defaultWebcamDevice.deviceId,
+        },
+      });
+      state = get();
+    }
+    // device lost
+    if (
+      state.deviceConfig.webcam &&
+      !devices.find(
+        (device) =>
+          device.kind === "videoinput" &&
+          device.deviceId === state.deviceConfig.webcam
+      )
+    ) {
+      get().muteWebcam();
+      set({
+        deviceConfig: {
+          ...get().deviceConfig,
+          webcam: undefined,
+        },
+      });
+
+      // fallback to default
+      if (defaultWebcamDevice) {
+        set({
+          deviceConfig: {
+            ...get().deviceConfig,
+            webcam: defaultWebcamDevice.deviceId,
+          },
+        });
+        get().unmuteWebcam();
+      }
+      state = get();
     }
   },
 }));
@@ -411,12 +577,35 @@ useLocalStreams.subscribe((state) => {
   useProducerStore.getState().onStreamUpdate(state);
 });
 
+const updateAvailableDevices = () => {
+  navigator.mediaDevices.enumerateDevices().then((devices) => {
+    useLocalStreams.getState().setAvailableDevices(devices);
+  });
+};
+
+navigator.mediaDevices.ondevicechange = () => {
+  updateAvailableDevices();
+};
+
+updateAvailableDevices();
+
+export const requestPermissions = () => {
+  navigator.mediaDevices.getUserMedia({ audio: true, video: true }).then(() => {
+    updateAvailableDevices();
+  });
+};
+
 const hark = require("hark");
 
 export interface StreamConfig {
   audio: boolean;
   webcam: boolean;
   screen: boolean;
+}
+
+export interface DeviceConfig {
+  audio?: string;
+  webcam?: string;
 }
 
 export interface StreamSettings extends StreamConfig {

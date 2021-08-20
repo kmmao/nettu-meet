@@ -12,6 +12,7 @@ import {
     Worker,
 } from 'mediasoup/lib/types';
 import { config } from './config';
+import {logger} from "../../../../logger"
 
 const mediasoupWorkers: Worker[] = [];
 const numWorkers = os.cpus().length;
@@ -26,7 +27,7 @@ const getNextWorker = (): Worker => {
 /**
  * Launch as many mediasoup Workers as given in the configuration file.
  */
-export async function runMediasoupWorkers() {
+export async function runMediasoupWorkers(): Promise<void> {
     for (let i = 0; i < numWorkers; ++i) {
         const worker = await createWorker({
             logLevel: config.mediasoup.worker.logLevel,
@@ -36,7 +37,7 @@ export async function runMediasoupWorkers() {
         });
 
         worker.on('died', () => {
-            console.error('mediasoup Worker died, exiting  in 2 seconds... [pid:%d]', worker.pid);
+            logger.error({workerId : worker.pid}, 'mediasoup Worker died, exiting  in 2 seconds... [pid:%d]', worker.pid);
 
             setTimeout(() => process.exit(1), 2000);
         });
@@ -60,6 +61,7 @@ interface PeerConsumerLayer {
 
 interface Peer {
     id: string;
+    name: string;
     // socket: Socket;
     joinTs: number;
     lastSeenTs: number;
@@ -86,10 +88,11 @@ export interface RoomState {
 // and one "room" ...
 //
 export const createRoom = async (roomId: string): Promise<RoomState> => {
-    if (rooms.has(roomId)) {
-        return rooms.get(roomId)!;
+    const existingRoom = rooms.get(roomId);
+    if (existingRoom) {
+        return existingRoom;
     }
-    console.log('Creating room: ' + roomId);
+    logger.info({roomId : roomId}, 'Creating room: ' + roomId);
 
     const mediaCodecs = config.mediasoup.router.mediaCodecs;
     const worker = getNextWorker();
@@ -102,7 +105,7 @@ export const createRoom = async (roomId: string): Promise<RoomState> => {
     });
     audioLevelObserver.on('volumes', (volumes) => {
         const { producer, volume } = volumes[0];
-        console.log('audio-level volumes event', producer.appData.peerId, volume);
+        logger.info({peerId : producer.appData.peerId, volume : volume}, 'audio-level volumes event');
         const room = rooms.get(roomId);
         if (!room) return;
         room.activeSpeaker.producerId = producer.id;
@@ -110,7 +113,7 @@ export const createRoom = async (roomId: string): Promise<RoomState> => {
         room.activeSpeaker.peerId = producer.appData.peerId;
     });
     audioLevelObserver.on('silence', () => {
-        console.log('audio-level silence event');
+        logger.info('audio-level silence event');
         const room = rooms.get(roomId);
         if (!room) return;
         room.activeSpeaker.producerId = null;
